@@ -6,8 +6,7 @@ import copy
 from collections import defaultdict
 import warnings
 import matplotlib.colors as mcolors
-
-from mecamecode.mecode.devices.RobotKinematicTracker import RobotKinematicTracker
+from mecode.devices.RobotKinematicTracker import RobotKinematicTracker
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -3709,133 +3708,100 @@ class G(object):
     def activaterobot(self):
         self._log_robot_cmd("ActivateRobot")
 
-    # Starts the homing sequence
     def homerobot(self):
         self._log_robot_cmd("Home")
 
-    # Waits until homing is complete
     def waithome(self):
         self._log_robot_cmd("WaitHomed")
 
-    # Moves the robot to absolute joint positions
     def movejoints(self, j1, j2, j3, j4, j5, j6):
-        angles=[j1,j2,j3,j4,j5,j6]
+        angles = [j1, j2, j3, j4, j5, j6]
         self.tracker.track_abs(angles)
-        pos_, _ = self.tracker.forward_kin(angles)
-        self.tracker.path.append(pos_.tolist())
-
+        pos, euler = self.tracker.forward_kin(angles)
+        self.tracker.path.append((pos.tolist() + euler))
         self._log_robot_cmd(f"MoveJoints {j1} {j2} {j3} {j4} {j5} {j6}")
 
-    # Moves the robot to a Cartesian pose
-    def movelin(self, x, y, z, a, b, c):
-        angles = self.tracker.solve_full_ik(x, y, z, a, b, c)  # Inverse kinematics
-        self.tracker.track_abs(angles)  # Store joint angles
-        pos_, _ = self.tracker.forward_kin(angles)  # Forward kinematics for position
-        self.tracker.path.append(pos_.tolist())  # Log end-effector position
-
-        self._log_robot_cmd(f"MoveLin {x} {y} {z} {a} {b} {c}")
-
-    # Moves the robot to a Cartesian pose relative to its current pose
-    def movelinrel(self, x, y, z, a, b, c):
-        last_angles = self.tracker.joints_stack[-1]
-        current_pos, _ = self.tracker.forward_kin(last_angles)
-
-        # 2. Compute new pose
-        new_pos = current_pos + np.array([x, y, z])  # Apply relative offset
-        new_orientation = [a, b, c]
-
-        # 3. Inverse kinematics
-        angles = self.tracker.solve_full_ik(*new_pos, *new_orientation)
-
-        # 4. Track and update
-        self.tracker.track_abs(angles)
-        pos_, _ = self.tracker.forward_kin(angles)
-        self.tracker.path.append(pos_.tolist())
-        self._log_robot_cmd(f"MoveLinRel {x} {y} {z} {a} {b} {c}")
-
-    # Moves the robot to a joint position relative to its current joint values
     def movejointsrel(self, j1, j2, j3, j4, j5, j6):
         rel_angles = [j1, j2, j3, j4, j5, j6]
-
-        self.tracker.track_rel(rel_angles)  # Track relative joint update
-        new_angles = self.tracker.joints_stack[-1]  # Get updated absolute joints
-        pos_, _ = self.tracker.forward_kin(new_angles)  # Compute new EE position
-        self.tracker.path.append(pos_.tolist())  # Append to path log
-
+        self.tracker.track_rel(rel_angles)
+        new_angles = self.tracker.joints_stack[-1]
+        pos, euler = self.tracker.forward_kin(new_angles)
+        self.tracker.path.append((pos.tolist() + euler))
         self._log_robot_cmd(f"MoveJointsRel {j1} {j2} {j3} {j4} {j5} {j6}")
 
-    # Waits until all robot motion has stopped
+    def movepose(self, x, y, z, a, b, c):
+        angles, config = self.tracker.solve_full_ik(x, y, z, a, b, c)
+        self.tracker.track_abs(angles)
+        self.tracker.path.append([x, y, z, a, b, c])
+        self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
+
+    def movelin(self, x, y, z, a, b, c):
+        angles, config = self.tracker.solve_full_ik(x, y, z, a, b, c)
+        self.tracker.track_abs(angles)
+        pos, euler = self.tracker.forward_kin(angles)
+        self.tracker.path.append(pos.tolist() + euler)
+        self._log_robot_cmd(f"MoveLin {x} {y} {z} {a} {b} {c}")
+
+    def movelinrel(self, x, y, z, a, b, c):
+        if not self.tracker.path:
+            raise ValueError("No pose to move relative from.")
+        last_pose = self.tracker.path[-1]
+        new_pose = [last_pose[i] + delta for i, delta in enumerate([x, y, z, a, b, c])]
+        angles, config = self.tracker.solve_full_ik(*new_pose)
+        self.tracker.track_abs(angles)
+        pos, euler = self.tracker.forward_kin(angles)
+        self.tracker.path.append(pos.tolist() + euler)
+        self._log_robot_cmd(f"MoveLinRel {x} {y} {z} {a} {b} {c}")
+
     def waitidle(self):
         self._log_robot_cmd("WaitIdle")
 
-    # Powers off the robot
     def decativaterobot(self):
         self._log_robot_cmd("DeactivateRobot")
 
-    # Disconnects from the robot (no ASCII command, internal Python logic)
     def disconnect(self):
         if self.robot:
             self.robot.Disconnect()
 
-    # Sets a checkpoint number for synchronization
     def setcheckpoint(self, n):
         self._log_robot_cmd(f"SetCheckpoint {n}")
 
-    # Waits until the specified checkpoint is reached
     def waitcheckpoint(self, n):
         self._log_robot_cmd(f"WaitCheckpoint {n}")
 
-    # Pauses all current robot motion
     def pausemotion(self):
         self._log_robot_cmd("PauseMotion")
 
-    # Resumes motion after being paused
     def resumemotion(self):
         self._log_robot_cmd("ResumeMotion")
 
-    # Stops all robot motion immediately
     def stopmotion(self):
         self._log_robot_cmd("StopMotion")
 
-    # Clears any active error on the robot
     def reseterror(self):
         self._log_robot_cmd("ResetError")
 
-    # Clears all current exceptions (only if raised)
     def clearexceptions(self):
         self._log_robot_cmd("ClearExceptions")
 
-    # Sets the linear velocity for Cartesian motion (in mm/s)
     def setlinvel(self, speed):
         self._log_robot_cmd(f"SetLinVel {speed}")
 
-    # Sets the linear acceleration for Cartesian motion (in mm/s^2)
     def setlinacc(self, acc):
         self._log_robot_cmd(f"SetLinAcc {acc}")
 
-    # Sets the joint velocity (in deg/s)
     def setjointvel(self, speed):
         self._log_robot_cmd(f"SetJointVel {speed}")
 
-    # Sets the joint acceleration (in deg/s^2)
     def setjointacc(self, acc):
         self._log_robot_cmd(f"SetJointAcc {acc}")
 
-    # Sets the motion blending percentage (0 = no blend, 100 = max blend)
     def setblending(self, value):
         self._log_robot_cmd(f"SetBlending {value}")
 
-    def movepose(self, x, y, z, a, b, c):
-        # Solve IK to get joint angles from desired end-effector pose
-        angles = self.tracker.solve_full_ik(x, y, z, a, b, c)
-
-        # Track joints and store the pose (directly use x, y, z)
-        self.tracker.track_abs(angles)
-        self.tracker.path.append([x, y, z])  # Direct input = EE position
-
-        self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
     def getpath(self):
-        print(self.tracker.path)
+        for pose in self.tracker.path:
+            print(pose)
 
 
 

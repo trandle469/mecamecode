@@ -63,13 +63,15 @@ class RobotKinematicTracker:
         # Step 2: Define the DH parameters table
         # Format per row: [thetaᵢ, dᵢ, aᵢ, alphaᵢ]
         # All units in meters and radians
+        # all distances in meters
         dh_params = [
-            [joints[0], 0.0, 0.0, np.pi / 2],  # Joint 1: rotates, no offset, 90° twist
-            [joints[1], 0.0, 0.135, 0.0],  # Joint 2: 135mm link, same axis
-            [joints[2], 0.0, 0.135, 0.0],  # Joint 3: 135mm link, same axis
-            [joints[3], 0.038, 0.0, np.pi / 2],  # Joint 4: 38mm z offset, 90° twist
-            [joints[4], 0.0, 0.0, -np.pi / 2],  # Joint 5: twist back -90°
-            [joints[5], 0.07, 0.0, 0.0],  # Joint 6: tool offset 70mm along z
+            # θ,        d,       a,       α
+            [joints[0], 0.135, 0.0, np.pi / 2],  # J1: base height = 135 mm
+            [joints[1], 0.0, 0.135, 0.0],  # J2: a2 = 135 mm
+            [joints[2], 0.0, 0.135, 0.0],  # J3: a3 = 135 mm
+            [joints[3], 0.038, 0.120, np.pi / 2],  # J4: d4 = 38 mm, a4 = 120 mm
+            [joints[4], 0.0, 0.0, -np.pi / 2],  # J5
+            [joints[5], 0.070, 0.0, 0.0],  # J6: TCP offset = 70 mm
         ]
 
         # Step 3: Initialize the final transformation matrix as the identity matrix
@@ -144,41 +146,47 @@ class RobotKinematicTracker:
         P_wc = P_tcp - d6 * z_axis  # Wrist center = TCP - d6 * ẑ
         return P_wc, R
 
-    def solve_position_ik(self, P_wc):
+    def solve_position_ik(self, P_wc, cs=1, ce=1):
         """
         Solves for joints 1–3 given the wrist center position.
-        Returns joint angles [j1, j2, j3] in degrees.
+        Supports posture configuration via cs (shoulder) and ce (elbow).
+
+        Parameters:
+        - P_wc: wrist center [x, y, z] in mm
+        - cs: shoulder config (1=front, -1=back)
+        - ce: elbow config (1=elbow up, -1=elbow down)
+
+        Returns:
+        - [j1, j2, j3] in degrees
         """
         x, y, z = P_wc
         a2 = 135
         a3 = 135
-        d4 = 38  # z-offset between joint 3 and 4
 
-        # 1. Joint 1
+        # Joint 1
         j1 = np.arctan2(y, x)
+        if cs == -1:
+            j1 = j1 + np.pi if j1 < 0 else j1 - np.pi
 
-        # 2. Planar projection for joints 2 and 3
-        r = np.hypot(x, y)  # distance from base to wrist in XY
-        z_prime = z - 0  # if d1 = 0
+        r = np.hypot(x, y)
+        z_prime = z
 
-        # 3. Cosine Law to solve j3
+        # Cosine law
         D = (r ** 2 + z_prime ** 2 - a2 ** 2 - a3 ** 2) / (2 * a2 * a3)
         if abs(D) > 1:
             raise ValueError("Unreachable position for IK.")
+        D = np.clip(D, -1.0, 1.0)  # Prevent floating-point errors
 
         j3 = np.arccos(D)
+        if ce == -1:
+            j3 = -j3
 
-        # 4. Solve for j2 using triangle geometry
+        # Joint 2
         phi1 = np.arctan2(z_prime, r)
         phi2 = np.arctan2(a3 * np.sin(j3), a2 + a3 * np.cos(j3))
         j2 = phi1 - phi2
 
-        # Convert to degrees
-        j1_deg = np.degrees(j1)
-        j2_deg = np.degrees(j2)
-        j3_deg = np.degrees(j3)
-
-        return [j1_deg, j2_deg, j3_deg]
+        return np.degrees([j1, j2, j3])
 
     def compute_T0_3(self, joints_deg):
         """
@@ -231,11 +239,57 @@ class RobotKinematicTracker:
 
         return [j4_deg, j5_deg, j6_deg]
 
-    def solve_full_ik(self, x, y, z, alpha, beta, gamma):
+    def solve_full_ik(self, x, y, z, alpha, beta, gamma, desired_config=(1, 1, -1), desired_ct=0):
+
         P_wc, R = self.compute_wrist_center(x, y, z, alpha, beta, gamma)
-        j1_to_j3 = self.solve_position_ik(P_wc)
-        j4_to_j6 = self.solve_orientation_ik(R, j1_to_j3)
-        return j1_to_j3 + j4_to_j6
+        cs, ce, cw = desired_config
+
+        try:
+            j1_to_j3 = self.solve_position_ik(P_wc, cs, ce)
+            j4_to_j6 = self.solve_orientation_ik(R, j1_to_j3, cw, desired_ct)
+            joints = j1_to_j3 + j4_to_j6
+            ct = round(joints[5] / 360)
+            self.last_config = (cs, ce, cw, ct)
+            if abs(joints[4]) < 1e-1:
+                print("Warning: θ5 near 0° → possible wrist singularity.")
+            return joints, self.last_config
+        except ValueError as e:
+            raise ValueError(f"IK failed for config (cs={cs}, ce={ce}, cw={cw}): {e}")
+
+
+
+class Kinematics:
+    def __int__(self):
+        self.path=[]
+        self.joints_stack=[]
+
+    def DH_transform(self, theta,d,a,alpha):
+        np.array([])
+
+    def FK(self,joints):
+        #standard DH method
+        dhs_parms_std=[[joints[0],135,0,np.pi/2],
+                       [joints[1],0,0,        0],
+                       [joints[2],0,135,      0],
+                       [joints[3],38,0,-np.pi/2],
+                       [joints[4],0,0, -np.pi/2],
+                       [joints[5],70,0,       0]]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
