@@ -6,7 +6,7 @@ import copy
 from collections import defaultdict
 import warnings
 import matplotlib.colors as mcolors
-from mecode.devices.RobotKinematicTracker import RobotKinematicTracker,Kinematics
+from mecode.devices.RobotKinematicTracker import Kinematics
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -116,7 +116,7 @@ class G(object):
             lineending insertion.
 
         """
-        self.tracker=RobotKinematicTracker()
+
         self.kins=Kinematics()
         self.outfile = outfile
         self.print_lines = print_lines
@@ -3716,14 +3716,17 @@ class G(object):
         self._log_robot_cmd("WaitHomed")
 
     def movejoints(self, j1, j2, j3, j4, j5, j6):
-        angles = [np.radians(j1), np.radians(j2),
-                  np.radians(j3), np.radians(j4),
-                  np.radians(j5), np.radians(j6)]
+        # 1) Build the joint list in radians
+        angles = [np.radians(a) for a in (j1, j2, j3, j4, j5, j6)]
 
-        # Add to joints_stack so future IK calls know the current position
+        # 2) Store the new joint state for future IK seeding
         self.kins.joints_stack.append(angles)
 
-        print(self.kins.FK_full(angles))
+        # 3) Compute the flange position via your Kinematics.FK_position_only
+        flange_pos = self.kins.FK_position_only(angles)  # returns [x,y,z]
+        self.kins.path.append(flange_pos.tolist())
+
+        # 4) Emit the low‑level robot command
         self._log_robot_cmd(f"MoveJoints {j1} {j2} {j3} {j4} {j5} {j6}")
 
     def movejointsrel(self, j1, j2, j3, j4, j5, j6):
@@ -3735,42 +3738,28 @@ class G(object):
         self._log_robot_cmd(f"MoveJointsRel {j1} {j2} {j3} {j4} {j5} {j6}")
 
     def movepose(self, x, y, z, a, b, c, config=None):
-        """Move to Cartesian pose using smart IK that considers previous joint configuration"""
-
+        """Move to a Cartesian flange pose using IK_smart, then record result."""
         if config is None:
-            # Use smart IK that automatically selects best configuration
-            joint_angles, success, selected_config = self.kins.IK_smart(x, y, z, a, b, c)
-
-            if success:
-                # Convert to degrees for logging
-                joints_deg = [np.degrees(j) for j in joint_angles]
-
-                # Log the command
-                self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
-
-                # Optional: Print debug info
-                print(f"MovePose: [{x}, {y}, {z}] mm, [{a}, {b}, {c}]°")
-                print(f"Selected config: {selected_config}")
-                print(f"Joint angles (deg): {[f'{j:.1f}' for j in joints_deg]}")
-
-                return joint_angles
-            else:
-                raise ValueError(f"Smart IK failed for pose [{x}, {y}, {z}, {a}, {b}, {c}] - target may be unreachable")
-
+            sol, success, used_cfg = self.kins.IK_smart(x, y, z, a, b, c)
         else:
-            # Use original IK with specific configuration (for backward compatibility)
-            joint_angles, success = self.kins.IK(x, y, z, a, b, c, config)
-
+            sol, success = self.kins.IK(x, y, z, a, b, c, config)
             if success:
-                # Add to joints_stack manually since we're not using smart IK
-                self.kins.joints_stack.append(joint_angles)
+                self.kins.joints_stack.append(sol)  # Add this line!
+            used_cfg = config
 
-                # Convert to degrees for logging
-                joints_deg = [np.degrees(j) for j in joint_angles]
-                self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
-                return joint_angles
-            else:
-                raise ValueError(f"IK failed for pose [{x}, {y}, {z}, {a}, {b}, {c}] with config {config}")
+        if not success:
+            raise ValueError(f"IK failed for pose [{x}, {y}, {z}, {a}, {b}, {c}]")
+
+        # Compute flange position for path tracking
+        flange_pos = self.kins.FK_position_only(sol)
+        self.kins.path.append(flange_pos.tolist())
+
+        # Emit the robot command
+        self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
+
+        return sol
+
+
 
     def movelin(self, x, y, z, a, b, c):
         angles, config = self.tracker.solve_full_ik(x, y, z, a, b, c)
@@ -3837,8 +3826,10 @@ class G(object):
         self._log_robot_cmd(f"SetBlending {value}")
 
     def getpath(self):
-        for pose in self.tracker.path:
-            print(pose)
+        return self.kins.path
+
+    def getjoints(self):
+        return self.kins.joints_stack
 
 
 
