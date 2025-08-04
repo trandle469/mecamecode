@@ -3716,18 +3716,32 @@ class G(object):
         self._log_robot_cmd("WaitHomed")
 
     def movejoints(self, j1, j2, j3, j4, j5, j6):
-        # 1) Build the joint list in radians
-        angles = [np.radians(a) for a in (j1, j2, j3, j4, j5, j6)]
+        """
+        Move robot joints to specified angles and log the trajectory via FK.
 
-        # 2) Store the new joint state for future IK seeding
-        self.kins.joints_stack.append(angles)
+        Args:
+            j1…j6 (float): Joint angles in degrees, per Meca500 conventions.
+        """
+        # 1. Build the joint angle list (in °)
+        joint_angles = [j1, j2, j3, j4, j5, j6]
 
-        # 3) Compute the flange position via your Kinematics.FK_position_only
-        flange_pos = self.kins.FK_position_only(angles)  # returns [x,y,z]
-        self.kins.path.append(flange_pos.tolist())
+        # 2. Compute FK — this will:
+        #    • convert each θi to radians (adding your static offsets),
+        #    • chain the Standard DH transforms (using d in mm, a in mm, α in ° → rad),
+        #    • append joint_angles and computed TCP position (in mm) into
+        #      self.kins.joints_stack and self.kins.path respectively.
+        position, rotation = self.kins.FK(joint_angles)
 
-        # 4) Emit the low‑level robot command
+        # 3. (Optional) If you need to inspect or return the new path:
+        #    path = self.kins.get_path()
+
+        # 4. Emit the actual robot command
         self._log_robot_cmd(f"MoveJoints {j1} {j2} {j3} {j4} {j5} {j6}")
+
+        # 5. You now have:
+        #    • self.kins.joints_stack[-1] == joint_angles
+        #    • self.kins.path[-1]        == position.tolist()
+        return position, rotation
 
     def movejointsrel(self, j1, j2, j3, j4, j5, j6):
         rel_angles = [j1, j2, j3, j4, j5, j6]
@@ -3737,24 +3751,25 @@ class G(object):
         self.tracker.path.append((pos.tolist() + euler))
         self._log_robot_cmd(f"MoveJointsRel {j1} {j2} {j3} {j4} {j5} {j6}")
 
-    def movepose(self, x, y, z, a, b, c, config=None):
-        """Move to a Cartesian flange pose using IK_smart, then record result."""
-        if config is None:
-            sol, success, used_cfg = self.kins.IK_smart(x, y, z, a, b, c)
-        else:
-            sol, success = self.kins.IK(x, y, z, a, b, c, config)
-            if success:
-                self.kins.joints_stack.append(sol)  # Add this line!
-            used_cfg = config
+    def movepose(self, x, y, z, a, b, c, initial_guess=None):
+        """
+        Move to a Cartesian flange pose via the numerical IK, then record the result.
 
-        if not success:
-            raise ValueError(f"IK failed for pose [{x}, {y}, {z}, {a}, {b}, {c}]")
+        Args:
+            x, y, z (float): target TCP position in mm
+            a, b, c (float): target TCP orientation (Euler XYZ) in degrees
+            initial_guess (list of 6 floats, optional): starting joint angles (°) for the IK solver.
+                If None, the solver will use the last commanded joints (or zeros on its first call).
+        Returns:
+            sol (list of 6 floats): the joint angles [θ1…θ6] in degrees
+        """
+        # 1. Solve IK numerically (uses DLS + screw‐Jacobian)
+        sol = self.kins.IK([x, y, z, a, b, c], initial_guess=initial_guess)
 
-        # Compute flange position for path tracking
-        flange_pos = self.kins.FK_position_only(sol)
-        self.kins.path.append(flange_pos.tolist())
+        # 2. Compute FK to log the final TCP position (mm)
+        tcp_pos_mm, _ = self.kins.FK(sol)
 
-        # Emit the robot command
+        # 3. Send the ASCII MovePose command to the controller
         self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
 
         return sol
@@ -3826,7 +3841,8 @@ class G(object):
         self._log_robot_cmd(f"SetBlending {value}")
 
     def getpath(self):
-        return self.kins.path
+
+        return print(self.kins.path)
 
     def getjoints(self):
         return self.kins.joints_stack
