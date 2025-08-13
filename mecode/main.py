@@ -7,6 +7,7 @@ from collections import defaultdict
 import warnings
 import matplotlib.colors as mcolors
 from mecode.devices.RobotKinematicTracker import Kinematics
+from typing import List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -118,6 +119,7 @@ class G(object):
         """
 
         self.kins=Kinematics()
+
         self.outfile = outfile
         self.print_lines = print_lines
         self.header = header
@@ -3715,73 +3717,383 @@ class G(object):
     def waithome(self):
         self._log_robot_cmd("WaitHomed")
 
-    def movejoints(self, j1, j2, j3, j4, j5, j6):
+    def _clip_to_limits(self, q):
+        q = list(q)
+        for i in range(5):  # J6 unlimited
+            q[i] = float(np.clip(q[i], self.kins.lower_deg[i], self.kins.upper_deg[i]))
+        return q
+
+    def movejoints(
+            self,
+            j1: float, j2: float, j3: float, j4: float, j5: float, j6: float,
+            *,
+            draw: bool = True,
+            record: bool = True,
+            teleport_on_nodraw: bool = True,
+    ):
         """
-        Move robot joints to specified angles and log the trajectory via FK.
-
-        Args:
-            j1…j6 (float): Joint angles in degrees, per Meca500 conventions.
+        Absolute joint move (deg). Optionally 'draw' into the current stroke
+        and/or 'record' to kins.path/joints. If draw=False and teleport_on_nodraw=True,
+        we log a teleport (pen up) so the next stroke won't connect across this move.
         """
-        # 1. Build the joint angle list (in °)
-        joint_angles = [j1, j2, j3, j4, j5, j6]
+        k = self.kins
+        q_new = [float(j1), float(j2), float(j3), float(j4), float(j5), float(j6)]
 
-        # 2. Compute FK — this will:
-        #    • convert each θi to radians (adding your static offsets),
-        #    • chain the Standard DH transforms (using d in mm, a in mm, α in ° → rad),
-        #    • append joint_angles and computed TCP position (in mm) into
-        #      self.kins.joints_stack and self.kins.path respectively.
-        position, rotation = self.kins.FK(joint_angles)
+        # previous pose (for teleport if needed)
+        if getattr(k, "joints", None) and len(k.joints) > 0:
+            prev_q = k.joints[-1]
+            prev_pose = k.fk_pose(prev_q)
+        else:
+            prev_q = None
+            prev_pose = None
 
-        # 3. (Optional) If you need to inspect or return the new path:
-        #    path = self.kins.get_path()
+        # FK for new pose
+        pose_mm_deg = k.fk_pose(q_new)
 
-        # 4. Emit the actual robot command
-        self._log_robot_cmd(f"MoveJoints {j1} {j2} {j3} {j4} {j5} {j6}")
+        # always update "current" state in memory by appending to joints/path if record=True
+        if record:
+            if hasattr(k, "path"):   k.path.append(list(pose_mm_deg))
+            if hasattr(k, "joints"): k.joints.append([float(v) for v in q_new])
 
-        # 5. You now have:
-        #    • self.kins.joints_stack[-1] == joint_angles
-        #    • self.kins.path[-1]        == position.tolist()
-        return position, rotation
+        # drawing / teleport logic
+        if draw:
+            if hasattr(k, "_append_point_to_stroke"):
+                k._append_point_to_stroke(pose_mm_deg, q_new, source="MoveJoints")
+        else:
+            if teleport_on_nodraw and prev_pose is not None and hasattr(k, "_record_teleport"):
+                k._record_teleport(prev_pose, pose_mm_deg, from_cmd="MoveJoints(nodraw)")
 
-    def movejointsrel(self, j1, j2, j3, j4, j5, j6):
-        rel_angles = [j1, j2, j3, j4, j5, j6]
-        self.tracker.track_rel(rel_angles)
-        new_angles = self.tracker.joints_stack[-1]
-        pos, euler = self.tracker.forward_kin(new_angles)
-        self.tracker.path.append((pos.tolist() + euler))
-        self._log_robot_cmd(f"MoveJointsRel {j1} {j2} {j3} {j4} {j5} {j6}")
+        return {
+            "ok": True,
+            "joints_deg": q_new,
+            "pose": tuple(pose_mm_deg),
+            "note": f"movejoints(draw={draw}, record={record})"
+        }
 
-    def movepose(self, x, y, z, a, b, c, initial_guess=None):
+    def movejointsrel(self, dj1, dj2, dj3, dj4, dj5, dj6):
         """
-        Move to a Cartesian flange pose via the numerical IK, then record the result.
-
-        Args:
-            x, y, z (float): target TCP position in mm
-            a, b, c (float): target TCP orientation (Euler XYZ) in degrees
-            initial_guess (list of 6 floats, optional): starting joint angles (°) for the IK solver.
-                If None, the solver will use the last commanded joints (or zeros on its first call).
-        Returns:
-            sol (list of 6 floats): the joint angles [θ1…θ6] in degrees
+        Relative joint move (degrees). Deltas are applied to the last stored joint set,
+        or to home [0,0,0,0,0,0] if none exists yet.
+        Returns: (x, y, z, alpha, beta, gamma)  -> mm, deg (mobile XYZ)
         """
-        # 1. Solve IK numerically (uses DLS + screw‐Jacobian)
-        sol = self.kins.IK([x, y, z, a, b, c], initial_guess=initial_guess)
+        if not hasattr(self, "kins") or self.kins is None:
+            raise RuntimeError("self.kins is not set. Initialize Kinematics first.")
 
-        # 2. Compute FK to log the final TCP position (mm)
-        tcp_pos_mm, _ = self.kins.FK(sol)
+        # ensure logs exist
+        if not hasattr(self.kins, "path"):   self.kins.path = []
+        if not hasattr(self.kins, "joints"): self.kins.joints = []
 
-        # 3. Send the ASCII MovePose command to the controller
-        self._log_robot_cmd(f"MovePose {x} {y} {z} {a} {b} {c}")
+        curr = self.kins.joints[-1] if self.kins.joints else [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        deltas = [float(dj1), float(dj2), float(dj3), float(dj4), float(dj5), float(dj6)]
+        q_new = [c + d for c, d in zip(curr, deltas)]
 
-        return sol
+        # reuse absolute move
+        return self.movejoints(*q_new)
 
+    def MovePose(
+            self,
+            x_mm: float, y_mm: float, z_mm: float,
+            a_deg: float, b_deg: float, c_deg: float,
+            *,
+            q_last_deg: Optional[List[float]] = None,
+            w_pos: float = 1.0, w_ori: float = 1.0,
+            lam0: float = 1e-2, max_iters: int = 120,
+            step_deg_max: float = 4.0,
+            tol_pos_mm: float = 0.2, tol_ori_deg: float = 0.2,
+    ):
+        """Pen up & relocate to target pose (mm, deg). Records a teleport; does not draw."""
+        k = self.kins
+        target_xyz = (float(x_mm), float(y_mm), float(z_mm))
+        target_eul = (float(a_deg), float(b_deg), float(c_deg))
 
+        # continuity seed
+        if q_last_deg is None and getattr(k, "joints", None):
+            if len(k.joints) > 0:
+                q_last_deg = list(k.joints[-1])
 
-    def movelin(self, x, y, z, a, b, c):
-        angles, config = self.tracker.solve_full_ik(x, y, z, a, b, c)
-        self.tracker.track_abs(angles)
-        pos, euler = self.tracker.forward_kin(angles)
-        self.tracker.path.append(pos.tolist() + euler)
-        self._log_robot_cmd(f"MoveLin {x} {y} {z} {a} {b} {c}")
+        # start pose for teleport record
+        if getattr(k, "joints", None) and len(k.joints) > 0:
+            start_pose = k.fk_pose(k.joints[-1])
+        else:
+            start_pose = k.fk_pose(q_last_deg or [0, 0, 0, 0, 0, 0])
+
+        # IK (prefer multi-start if available)
+        if hasattr(k, "ik_solve_dls_auto"):
+            q_sol_deg, ok, iters = k.ik_solve_dls_auto(
+                target_xyz_mm=target_xyz,
+                target_euler_deg=target_eul,
+                q_last_deg=q_last_deg,
+                w_pos=w_pos, w_ori=w_ori,
+                lam0=lam0, max_iters_each=max_iters,
+                step_deg_max=step_deg_max,
+                tol_pos_mm=tol_pos_mm, tol_ori_deg=tol_ori_deg
+            )
+        else:
+            q_sol_deg, ok, iters = k.ik_solve_dls(
+                target_xyz_mm=target_xyz,
+                target_euler_deg=target_eul,
+                q0_deg=q_last_deg or [0, 0, 0, 0, 0, 0],
+                w_pos=w_pos, w_ori=w_ori,
+                lam0=lam0, max_iters=max_iters,
+                step_deg_max=step_deg_max,
+                tol_pos_mm=tol_pos_mm, tol_ori_deg=tol_ori_deg
+            )
+
+        # realized pose; always log to global debug streams
+        pose_mm_deg = k.fk_pose(q_sol_deg)
+        if hasattr(k, "path"):   k.path.append(list(pose_mm_deg))
+        if hasattr(k, "joints"): k.joints.append([float(v) for v in q_sol_deg])
+
+        # record teleport and leave pen up
+        if hasattr(k, "_record_teleport"):
+            k._record_teleport(start_pose, pose_mm_deg, from_cmd="MovePose")
+        else:
+            if not hasattr(k, "teleports"): k.teleports = []
+            k.teleports.append({"start": start_pose[:3], "end": pose_mm_deg[:3], "from_cmd": "MovePose"})
+            k.pen_down = False
+
+        return {
+            "ok": bool(ok),
+            "iters": int(iters),
+            "joints_deg": list(map(float, q_sol_deg)),
+            "pose": tuple(pose_mm_deg),
+            "note": "MovePose"
+        }
+
+    def MoveLin(
+            self,
+            x_mm: float, y_mm: float, z_mm: float,
+            a_deg: float, b_deg: float, c_deg: float,
+            *,
+            step_mm: float = 5.0,
+            step_deg: float = 2.0,
+            max_subdivisions: int = 3,
+            orient_mode: str = "slerp",  # "slerp" or "hold"
+            # IK tuning passthrough:
+            w_pos: float = 1.0, w_ori: float = 1.0,
+            lam0: float = 1e-2, ik_max_iters: int = 80,
+            ik_step_deg_max: float = 4.0,
+            tol_pos_mm: float = 0.2, tol_ori_deg: float = 0.2,
+    ):
+        """
+        Linear TCP move: straight line in XYZ (mm), optional orientation change (deg).
+        Draws (pen down): logs start pose + each waypoint into strokes + global path/joints.
+        """
+        k = self.kins
+
+        # --- local math helpers (self-contained) ---
+        def R_from_euler_xyz(a, b, c):
+            ca, sa = np.cos(a), np.sin(a)
+            cb, sb = np.cos(b), np.sin(b)
+            cc, sc = np.cos(c), np.sin(c)
+            Rx_ = np.array([[1, 0, 0], [0, ca, -sa], [0, sa, ca]], float)
+            Ry_ = np.array([[cb, 0, sb], [0, 1, 0], [-sb, 0, cb]], float)
+            Rz_ = np.array([[cc, -sc, 0], [sc, cc, 0], [0, 0, 1]], float)
+            return Rx_ @ Ry_ @ Rz_
+
+        def quat_from_R(R):
+            t = float(np.trace(R))
+            if t > 0:
+                s = np.sqrt(t + 1.0) * 2.0
+                w = 0.25 * s
+                x = (R[2, 1] - R[1, 2]) / s
+                y = (R[0, 2] - R[2, 0]) / s
+                z = (R[1, 0] - R[0, 1]) / s
+            else:
+                i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+                if i == 0:
+                    s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+                    w = (R[2, 1] - R[1, 2]) / s;
+                    x = 0.25 * s
+                    y = (R[0, 1] + R[1, 0]) / s;
+                    z = (R[0, 2] + R[2, 0]) / s
+                elif i == 1:
+                    s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+                    w = (R[0, 2] - R[2, 0]) / s
+                    x = (R[0, 1] + R[1, 0]) / s;
+                    y = 0.25 * s
+                    z = (R[1, 2] + R[2, 1]) / s
+                else:
+                    s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+                    w = (R[1, 0] - R[0, 1]) / s
+                    x = (R[0, 2] + R[2, 0]) / s
+                    y = (R[1, 2] + R[2, 1]) / s;
+                    z = 0.25 * s
+            q = np.array([w, x, y, z], float)
+            return q / np.linalg.norm(q)
+
+        def R_from_quat(q):
+            w, x, y, z = q
+            return np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]
+            ], float)
+
+        def slerp(q0, q1, t):
+            q0 = q0 / np.linalg.norm(q0)
+            q1 = q1 / np.linalg.norm(q1)
+            dot = float(np.dot(q0, q1))
+            if dot < 0.0:
+                q1 = -q1;
+                dot = -dot
+            dot = float(np.clip(dot, -1.0, 1.0))
+            if dot > 0.9995:
+                q = q0 + t * (q1 - q0)
+                return q / np.linalg.norm(q)
+            theta0 = np.arccos(dot);
+            theta = theta0 * t
+            q2 = (q1 - q0 * dot);
+            q2 /= np.linalg.norm(q2)
+            return q0 * np.cos(theta) + q2 * np.sin(theta)
+
+        def _mat_to_eul_deg_xyz_mecademic(R):
+            sy = -R[2, 0]
+            sy = float(np.clip(sy, -1.0, 1.0))
+            cy = np.sqrt(max(0.0, 1.0 - sy * sy))
+            if cy > 1e-9:
+                a = np.arctan2(R[2, 1], R[2, 2])  # X
+                b = np.arcsin(sy)  # Y
+                c = np.arctan2(R[1, 0], R[0, 0])  # Z
+            else:
+                a = np.arctan2(-R[1, 2], R[1, 1]);
+                b = np.arcsin(sy);
+                c = 0.0
+
+            def _wrap_pi(x):
+                return (x + np.pi) % (2 * np.pi) - np.pi
+
+            a = _wrap_pi(a);
+            b = float(np.clip(b, -np.pi / 2, np.pi / 2));
+            c = _wrap_pi(c)
+            if abs(abs(b) - np.pi / 2) < 1e-9:
+                c = _wrap_pi(c + a);
+                a = 0.0
+            return (np.degrees(a), np.degrees(b), np.degrees(c))
+
+        # ---- continuity seed ----
+        if getattr(k, "joints", None) and len(k.joints) > 0:
+            q_last = list(k.joints[-1])
+        else:
+            q_last = [0, 0, 0, 0, 0, 0]
+
+        # start pose (x0..c0)
+        x0, y0, z0, a0, b0, c0 = k.fk_pose(q_last)
+
+        # ensure stroke exists & log starting point so a line can appear
+        if hasattr(k, "_begin_stroke_if_needed"):
+            opened = (not k.pen_down)
+            k._begin_stroke_if_needed("MoveLin")
+            need_start = opened or len(k.strokes[-1]["points"]) == 0
+        else:
+            need_start = False
+
+        pose0 = k.fk_pose(q_last)
+        if need_start:
+            if hasattr(k, "path"):   k.path.append(list(pose0))
+            if hasattr(k, "joints"): k.joints.append([float(v) for v in q_last])
+            if hasattr(k, "_append_point_to_stroke"):
+                k._append_point_to_stroke(pose0, q_last, "MoveLin")
+
+        # targets
+        p0 = np.array([x0, y0, z0], float)
+        p1 = np.array([float(x_mm), float(y_mm), float(z_mm)], float)
+        if orient_mode == "hold":
+            a1, b1, c1 = a0, b0, c0
+        else:
+            a1, b1, c1 = float(a_deg), float(b_deg), float(c_deg)
+
+        # waypoint counts
+        dist = float(np.linalg.norm(p1 - p0))
+        n_pos = max(1, int(np.ceil(dist / max(step_mm, 1e-6))))
+        if orient_mode == "slerp":
+            R0 = R_from_euler_xyz(np.deg2rad(a0), np.deg2rad(b0), np.deg2rad(c0))
+            R1 = R_from_euler_xyz(np.deg2rad(a1), np.deg2rad(b1), np.deg2rad(c1))
+            q0_ = quat_from_R(R0);
+            q1_ = quat_from_R(R1)
+            cosang = np.clip(np.dot(q0_, q1_), -1.0, 1.0)
+            ang = 2 * np.arccos(abs(cosang))
+            n_ori = max(1, int(np.ceil(np.degrees(ang) / max(step_deg, 1e-6))))
+        else:
+            n_ori = 1
+
+        # --- recursive solver with bisection on failure ---
+        def solve_segment(pA_mm, eulA_deg, qA_deg, pB_mm, eulB_deg, depth=0):
+            nonlocal q_last
+            pA = np.asarray(pA_mm, float);
+            pB = np.asarray(pB_mm, float)
+
+            if orient_mode == "slerp":
+                R0 = R_from_euler_xyz(*np.deg2rad(eulA_deg))
+                R1 = R_from_euler_xyz(*np.deg2rad(eulB_deg))
+                qAq = quat_from_R(R0);
+                qBq = quat_from_R(R1)
+
+            seg_len = float(np.linalg.norm(pB - pA))
+            n_pos_loc = max(1, int(np.ceil(seg_len / max(step_mm, 1e-6))))
+            if orient_mode == "slerp":
+                cosang = np.clip(np.dot(qAq, qBq), -1.0, 1.0)
+                ang = 2 * np.arccos(abs(cosang))
+                n_ori_loc = max(1, int(np.ceil(np.degrees(ang) / max(step_deg, 1e-6))))
+            else:
+                n_ori_loc = 1
+
+            M = max(n_pos_loc, n_ori_loc)
+
+            for i in range(1, M + 1):
+                t = i / M
+                p_t = (1.0 - t) * pA + t * pB
+                if orient_mode == "slerp":
+                    q_t = slerp(qAq, qBq, t);
+                    R_t = R_from_quat(q_t)
+                    eul_t = _mat_to_eul_deg_xyz_mecademic(R_t)
+                else:
+                    eul_t = eulA_deg
+
+                q_sol, ok, _ = k.ik_solve_dls_auto(
+                    target_xyz_mm=tuple(p_t.tolist()),
+                    target_euler_deg=tuple(map(float, eul_t)),
+                    q_last_deg=q_last,
+                    w_pos=w_pos, w_ori=w_ori,
+                    lam0=lam0, max_iters_each=ik_max_iters,
+                    step_deg_max=ik_step_deg_max,
+                    tol_pos_mm=tol_pos_mm, tol_ori_deg=tol_ori_deg,
+                    prefer_continuity=True,
+                )
+
+                if not ok:
+                    if depth < max_subdivisions:
+                        mid_p = (pA + pB) * 0.5
+                        if orient_mode == "slerp":
+                            mid_q = slerp(qAq, qBq, 0.5)
+                            mid_R = R_from_quat(mid_q)
+                            mid_eul = _mat_to_eul_deg_xyz_mecademic(mid_R)
+                        else:
+                            mid_eul = eulA_deg
+                        ok1 = solve_segment(pA, eulA_deg, qA_deg, mid_p, mid_eul, depth + 1)
+                        if not ok1:
+                            return False
+                        return solve_segment(mid_p, mid_eul, q_last, pB, eulB_deg, depth + 1)
+                    else:
+                        return False
+
+                # log waypoint
+                pose_mm_deg = k.fk_pose(q_sol)
+                if hasattr(k, "path"):   k.path.append(list(pose_mm_deg))
+                if hasattr(k, "joints"): k.joints.append([float(v) for v in q_sol])
+                if hasattr(k, "_append_point_to_stroke"):
+                    k._append_point_to_stroke(pose_mm_deg, q_sol, "MoveLin")
+
+                q_last = q_sol  # continuity
+
+            return True
+
+        ok = solve_segment(
+            p0, (a0, b0, c0), q_last,
+            p1, (a1, b1, c1), depth=0
+        )
+
+        return {"ok": bool(ok), "note": "MoveLin"}
 
     def movelinrel(self, x, y, z, a, b, c):
         if not self.tracker.path:
@@ -3845,7 +4157,39 @@ class G(object):
         return print(self.kins.path)
 
     def getjoints(self):
-        return self.kins.joints_stack
+        return print(self.kins.joints)
 
+    def Plot3DPath(
+            self,
+            ax=None,
+            *,
+            show_teleports: bool = False,
+            color: str = "C0",
+            linewidth: float = 2.0,
+            teleport_style: dict | None = None,
+            equal_axes: bool = True,
+            title: str | None = "TCP Path (mm)",
+            save_path: str | None = None,
+    ):
+        """
+        Controller-level wrapper for self.kins.plot3d_path(...).
+        Returns the matplotlib Axes3D instance.
+        """
+        if not hasattr(self, "kins") or self.kins is None:
+            raise RuntimeError("Plot3DPath: self.kins is not set.")
 
+        return self.kins.plot3d_path(
+            ax=ax,
+            show_teleports=show_teleports,
+            color=color,
+            linewidth=linewidth,
+            teleport_style=teleport_style,
+            equal_axes=equal_axes,
+            title=title,
+            save_path=save_path,
+        )
 
+    def Plot3DPathInteractive(self, **kwargs):
+        fig = self.kins.plot3d_path_plotly(**kwargs)
+        fig.show()
+        return fig
